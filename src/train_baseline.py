@@ -64,8 +64,8 @@ def train(config_path: str):
     # Optimizer & scheduler
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=bcfg["learning_rate"],
-        weight_decay=bcfg["weight_decay"],
+        lr=float(bcfg["learning_rate"]),
+        weight_decay=float(bcfg["weight_decay"]),
     )
     total_steps = len(train_loader) * bcfg["num_epochs"]
     warmup_steps = int(total_steps * bcfg["warmup_ratio"])

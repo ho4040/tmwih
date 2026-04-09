@@ -1,5 +1,9 @@
 """Dataset loading and preprocessing for SNLI + OOD evaluation sets."""
 
+import os
+import urllib.request
+
+import pandas as pd
 from datasets import load_dataset, Dataset
 from transformers import PreTrainedTokenizer
 
@@ -34,20 +38,22 @@ def load_snli(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128, max_sam
     return ds
 
 
-def load_hans(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128):
-    """Load HANS evaluation set (OOD diagnostic for NLI)."""
-    try:
-        ds = load_dataset("jhu-cogsci/hans", split="validation", trust_remote_code=True)
-    except Exception:
-        ds = load_dataset("hans", split="validation", trust_remote_code=True)
+def load_hans(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128, data_dir: str = "data"):
+    """Load HANS evaluation set (OOD diagnostic for NLI) from raw TSV."""
+    hans_path = os.path.join(data_dir, "hans.tsv")
+    if not os.path.exists(hans_path):
+        os.makedirs(data_dir, exist_ok=True)
+        url = "https://raw.githubusercontent.com/tommccoy1/hans/master/heuristics_evaluation_set.txt"
+        print(f"Downloading HANS from {url}...")
+        urllib.request.urlretrieve(url, hans_path)
 
-    # HANS has only entailment (0) and non-entailment (1)
-    # Map non-entailment to contradiction (2) for 3-class compatibility
-    def map_labels(example):
-        example["label"] = 0 if example["label"] == 0 else 2
-        return example
+    df = pd.read_csv(hans_path, sep="\t")
+    # Map labels: entailment -> 0, non-entailment -> 2 (contradiction)
+    label_map = {"entailment": 0, "non-entailment": 2}
+    df["label"] = df["gold_label"].map(label_map)
+    df = df.rename(columns={"sentence1": "premise", "sentence2": "hypothesis"})
 
-    ds = ds.map(map_labels)
+    ds = Dataset.from_pandas(df[["premise", "hypothesis", "label"]])
 
     def tokenize(batch):
         return tokenizer(
@@ -58,9 +64,7 @@ def load_hans(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128):
             max_length=max_seq_length,
         )
 
-    # Remove all columns except those added by tokenization + label
-    cols_to_remove = [c for c in ds.column_names if c not in ["label", "input_ids", "attention_mask", "token_type_ids"]]
-    ds = ds.map(tokenize, batched=True, remove_columns=cols_to_remove)
+    ds = ds.map(tokenize, batched=True, remove_columns=["premise", "hypothesis"])
     ds.set_format("torch")
     return ds
 

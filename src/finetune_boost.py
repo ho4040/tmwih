@@ -140,7 +140,7 @@ def finetune(config_path: str, iteration: int = 1, model_dir: str | None = None)
     print(f"Pre-boosting: test_acc={pre_test_acc:.4f} | hans_acc={pre_hans_acc:.4f}")
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=bcfg["finetune_learning_rate"], weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(bcfg["finetune_learning_rate"]), weight_decay=0.01)
     total_steps = (len(cf_loader) + len(orig_loader)) * bcfg["finetune_epochs"]
     scheduler = get_linear_schedule_with_warmup(optimizer, int(total_steps * 0.1), total_steps)
 

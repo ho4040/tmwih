@@ -1,0 +1,56 @@
+# Tell Me Where It Hurts — Default Config
+
+# Model
+student_model: "bert-base-uncased"
+num_labels: 3  # entailment, neutral, contradiction
+
+# Dataset
+dataset: "stanfordnlp/snli"
+max_train_samples: null  # null = use all
+max_val_samples: null
+
+# Baseline Training
+baseline:
+  batch_size: 32
+  learning_rate: 2e-5
+  num_epochs: 3
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_seq_length: 128
+
+# Post-hoc Boosting
+boosting:
+  # Evaluate
+  max_failures: 500  # max failure cases to collect per iteration
+  attribution_method: "integrated_gradients"  # integrated_gradients | attention
+  ig_steps: 50  # Integrated Gradients steps
+
+  # Diagnose + Generate
+  teacher_model: "openai/gpt-5.4"  # via OpenRouter
+  samples_per_iteration: 200  # counterfactual pairs to generate per iteration
+  temperature: 0.7
+
+  # Finetune
+  finetune_batch_size: 16
+  finetune_learning_rate: 4e-6  # 1/5 of baseline LR
+  finetune_epochs: 3
+  contrastive_lambda: 0.3  # weight for contrastive loss
+  original_data_ratio: 0.5  # mix ratio of original data during finetune
+
+  # Loop control
+  improvement_threshold: 0.002  # stop if OOD improvement < this
+  max_iterations: 10
+
+# OpenRouter
+openrouter_base_url: "https://openrouter.ai/api/v1"
+
+# Evaluation
+eval_datasets:
+  id: "snli_test"  # in-distribution
+  ood:
+    - "kaushik_cad"  # Kaushik et al. counterfactual test set
+    - "hans"         # HANS heuristic diagnostic
+
+# Output
+output_dir: "outputs"
+seed: 42

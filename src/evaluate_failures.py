@@ -6,12 +6,33 @@ import os
 
 import torch
 import yaml
-from captum.attr import LayerIntegratedGradients
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from tqdm import tqdm
 
 from data import load_snli, decode_pair, LABEL_NAMES
+
+
+def compute_gradient_attribution(model, input_ids, attention_mask, target_label):
+    """Compute gradient-based attribution (input x gradient, normalized)."""
+    model.zero_grad()
+    embeddings = model.bert.embeddings.word_embeddings(input_ids)
+    embeddings.retain_grad()
+
+    # Forward through the rest of the model
+    outputs = model(inputs_embeds=embeddings, attention_mask=attention_mask)
+    logits = outputs.logits
+
+    # Backward for the target class
+    target_score = logits[0, target_label]
+    target_score.backward()
+
+    # Input x Gradient attribution
+    grad = embeddings.grad  # (1, seq_len, hidden_dim)
+    attr = (embeddings * grad).sum(dim=-1).squeeze(0)  # (seq_len,)
+    attr = attr.abs()
+    attr = attr / (attr.sum() + 1e-10)
+    return attr.detach()
 
 
 def collect_failures(config_path: str, model_dir: str | None = None):
@@ -30,13 +51,6 @@ def collect_failures(config_path: str, model_dir: str | None = None):
         model_dir, attn_implementation="eager"
     ).to(device)
     model.eval()
-
-    # Setup Integrated Gradients
-    def forward_func(input_embeds, attention_mask, token_type_ids=None):
-        outputs = model(inputs_embeds=input_embeds, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        return outputs.logits
-
-    lig = LayerIntegratedGradients(forward_func, model.bert.embeddings.word_embeddings)
 
     # Load validation set
     ds = load_snli(tokenizer, cfg["baseline"]["max_seq_length"], cfg.get("max_val_samples"))
@@ -67,23 +81,11 @@ def collect_failures(config_path: str, model_dir: str | None = None):
             continue
 
         # Extract attention (last layer, [CLS] token, averaged over heads)
-        # attentions shape: (num_layers, batch, num_heads, seq_len, seq_len)
         last_attn = outputs.attentions[-1]  # (1, num_heads, seq_len, seq_len)
-        cls_attn = last_attn[0, :, 0, :].mean(dim=0)  # (seq_len,) — avg over heads
+        cls_attn = last_attn[0, :, 0, :].mean(dim=0)  # (seq_len,)
 
-        # Compute Integrated Gradients
-        token_type_ids = batch.get("token_type_ids", torch.zeros_like(input_ids)).to(device)
-        attributions = lig.attribute(
-            input_ids,
-            additional_forward_args=(attention_mask, token_type_ids),
-            target=label,
-            n_steps=bcfg["ig_steps"],
-            return_convergence_delta=False,
-        )
-        # Sum over embedding dim to get per-token attribution
-        ig_attr = attributions.sum(dim=-1).squeeze(0)  # (seq_len,)
-        ig_attr = ig_attr.abs()  # use absolute values
-        ig_attr = ig_attr / (ig_attr.sum() + 1e-10)  # normalize
+        # Compute gradient attribution (input x gradient)
+        grad_attr = compute_gradient_attribution(model, input_ids, attention_mask, label)
 
         # Decode tokens
         tokens = tokenizer.convert_ids_to_tokens(input_ids[0].cpu())
@@ -97,7 +99,7 @@ def collect_failures(config_path: str, model_dir: str | None = None):
             token_info.append({
                 "token": tok,
                 "attention": round(cls_attn[i].item(), 4),
-                "gradient": round(ig_attr[i].item(), 4),
+                "gradient": round(grad_attr[i].item(), 4),
             })
 
         failures.append({

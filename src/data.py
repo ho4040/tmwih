@@ -36,7 +36,10 @@ def load_snli(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128, max_sam
 
 def load_hans(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128):
     """Load HANS evaluation set (OOD diagnostic for NLI)."""
-    ds = load_dataset("hans", split="validation")
+    try:
+        ds = load_dataset("jhu-cogsci/hans", split="validation", trust_remote_code=True)
+    except Exception:
+        ds = load_dataset("hans", split="validation", trust_remote_code=True)
 
     # HANS has only entailment (0) and non-entailment (1)
     # Map non-entailment to contradiction (2) for 3-class compatibility
@@ -55,7 +58,9 @@ def load_hans(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128):
             max_length=max_seq_length,
         )
 
-    ds = ds.map(tokenize, batched=True, remove_columns=["premise", "hypothesis", "parse_premise", "parse_hypothesis", "binary_parse_premise", "binary_parse_hypothesis", "heuristic", "subcase", "template"])
+    # Remove all columns except those added by tokenization + label
+    cols_to_remove = [c for c in ds.column_names if c not in ["label", "input_ids", "attention_mask", "token_type_ids"]]
+    ds = ds.map(tokenize, batched=True, remove_columns=cols_to_remove)
     ds.set_format("torch")
     return ds
 

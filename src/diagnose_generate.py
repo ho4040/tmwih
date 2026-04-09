@@ -140,29 +140,45 @@ def generate_pairs(client: OpenAI, model: str, patterns: list, samples_per_iter:
     """Generate counterfactual minimal pairs for each diagnosed pattern."""
     all_pairs = []
     per_pattern = max(1, samples_per_iter // len(patterns)) if patterns else 0
+    batch_size = 20  # generate in small batches to avoid LLM refusal
 
     for pattern in patterns:
-        print(f"  Generating {per_pattern} pairs for pattern: {pattern['pattern_id']}")
-        prompt = GENERATE_PROMPT.format(
-            n=per_pattern,
-            description=pattern["description"],
-            overrelied_tokens=", ".join(pattern.get("overrelied_tokens", [])),
-            missed_signal=pattern.get("missed_signal", "unknown"),
-        )
+        remaining = per_pattern
+        batch_num = 0
+        while remaining > 0:
+            n = min(batch_size, remaining)
+            batch_num += 1
+            print(f"  Pattern '{pattern['pattern_id']}' batch {batch_num}: generating {n} pairs...")
+            prompt = GENERATE_PROMPT.format(
+                n=n,
+                description=pattern["description"],
+                overrelied_tokens=", ".join(pattern.get("overrelied_tokens", [])),
+                missed_signal=pattern.get("missed_signal", "unknown"),
+            )
 
-        response = call_llm(client, model, GENERATE_SYSTEM, prompt, temperature)
+            response = call_llm(client, model, GENERATE_SYSTEM, prompt, temperature)
 
-        try:
-            pairs = json.loads(response)
-            if isinstance(pairs, dict) and "pairs" in pairs:
-                pairs = pairs["pairs"]
-            if not isinstance(pairs, list):
-                pairs = [pairs]
-            for p in pairs:
-                p["source_pattern"] = pattern["pattern_id"]
-            all_pairs.extend(pairs)
-        except json.JSONDecodeError:
-            print(f"  Warning: Failed to parse generation response for {pattern['pattern_id']}")
+            try:
+                pairs = json.loads(response)
+                if isinstance(pairs, dict):
+                    # Try common wrapper keys
+                    for key in ["pairs", "data", "examples", "results"]:
+                        if key in pairs:
+                            pairs = pairs[key]
+                            break
+                    else:
+                        pairs = [pairs]
+                if not isinstance(pairs, list):
+                    pairs = [pairs]
+                # Filter out error responses
+                pairs = [p for p in pairs if "anchor_premise" in p or "anchor_hypothesis" in p]
+                for p in pairs:
+                    p["source_pattern"] = pattern["pattern_id"]
+                all_pairs.extend(pairs)
+                remaining -= n
+            except json.JSONDecodeError:
+                print(f"  Warning: Failed to parse batch {batch_num}")
+                remaining -= n  # skip to avoid infinite loop
 
     print(f"Generated {len(all_pairs)} pairs total")
     return all_pairs

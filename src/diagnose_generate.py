@@ -80,7 +80,7 @@ Output as JSON array:
 [{{"index": i, "anchor_valid": true/false, "cf_valid": true/false, "reason": "..."}}]"""
 
 
-def call_llm(client: OpenAI, model: str, system: str, user: str, temperature: float = 0.7) -> str:
+def call_llm(client: OpenAI, model: str, system: str, user: str, temperature: float = 0.7, log_dir: str | None = None) -> str:
     """Call LLM via OpenRouter."""
     for attempt in range(3):
         try:
@@ -91,14 +91,60 @@ def call_llm(client: OpenAI, model: str, system: str, user: str, temperature: fl
                     {"role": "user", "content": user},
                 ],
                 temperature=temperature,
-                response_format={"type": "json_object"},
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+
+            # Log raw response for debugging
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+                log_file = os.path.join(log_dir, f"llm_response_{int(time.time())}.txt")
+                with open(log_file, "w") as f:
+                    f.write(content)
+
+            return content
         except Exception as e:
             print(f"  LLM call failed (attempt {attempt + 1}): {e}")
             if attempt < 2:
                 time.sleep(2 ** attempt)
     return "[]"
+
+
+def extract_json(text: str) -> list | dict | None:
+    """Extract JSON from LLM response, handling markdown code blocks."""
+    # Try direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting from ```json ... ``` blocks
+    import re
+    json_blocks = re.findall(r'```(?:json)?\s*([\s\S]*?)```', text)
+    for block in json_blocks:
+        try:
+            return json.loads(block.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Try finding array or object in the text
+    for start_char, end_char in [('[', ']'), ('{', '}')]:
+        start = text.find(start_char)
+        if start == -1:
+            continue
+        # Find matching end
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == start_char:
+                depth += 1
+            elif text[i] == end_char:
+                depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    break
+
+    return None
 
 
 def diagnose(client: OpenAI, model: str, failures: list, temperature: float = 0.7) -> list:
@@ -120,16 +166,23 @@ def diagnose(client: OpenAI, model: str, failures: list, temperature: float = 0.
     prompt = DIAGNOSE_PROMPT.format(failures="\n\n".join(formatted))
     print(f"Diagnosing {len(formatted)} failures...")
 
-    response = call_llm(client, model, DIAGNOSE_SYSTEM, prompt, temperature)
+    response = call_llm(client, model, DIAGNOSE_SYSTEM, prompt, temperature, log_dir="outputs/logs")
 
-    try:
-        patterns = json.loads(response)
-        if isinstance(patterns, dict) and "patterns" in patterns:
-            patterns = patterns["patterns"]
-        if not isinstance(patterns, list):
-            patterns = [patterns]
-    except json.JSONDecodeError:
+    parsed = extract_json(response)
+    if parsed is None:
         print("Warning: Failed to parse diagnosis response")
+        patterns = []
+    elif isinstance(parsed, dict):
+        # Try common wrapper keys
+        for key in ["patterns", "data", "results"]:
+            if key in parsed:
+                patterns = parsed[key]
+                break
+        else:
+            patterns = [parsed]
+    elif isinstance(parsed, list):
+        patterns = parsed
+    else:
         patterns = []
 
     print(f"Found {len(patterns)} weakness patterns")
@@ -156,29 +209,33 @@ def generate_pairs(client: OpenAI, model: str, patterns: list, samples_per_iter:
                 missed_signal=pattern.get("missed_signal", "unknown"),
             )
 
-            response = call_llm(client, model, GENERATE_SYSTEM, prompt, temperature)
+            response = call_llm(client, model, GENERATE_SYSTEM, prompt, temperature, log_dir="outputs/logs")
 
-            try:
-                pairs = json.loads(response)
-                if isinstance(pairs, dict):
-                    # Try common wrapper keys
-                    for key in ["pairs", "data", "examples", "results"]:
-                        if key in pairs:
-                            pairs = pairs[key]
-                            break
-                    else:
-                        pairs = [pairs]
-                if not isinstance(pairs, list):
-                    pairs = [pairs]
-                # Filter out error responses
-                pairs = [p for p in pairs if "anchor_premise" in p or "anchor_hypothesis" in p]
-                for p in pairs:
-                    p["source_pattern"] = pattern["pattern_id"]
-                all_pairs.extend(pairs)
-                remaining -= n
-            except json.JSONDecodeError:
+            parsed = extract_json(response)
+            if parsed is None:
                 print(f"  Warning: Failed to parse batch {batch_num}")
-                remaining -= n  # skip to avoid infinite loop
+                remaining -= n
+                continue
+
+            if isinstance(parsed, dict):
+                for key in ["pairs", "data", "examples", "results"]:
+                    if key in parsed:
+                        pairs = parsed[key]
+                        break
+                else:
+                    pairs = [parsed]
+            elif isinstance(parsed, list):
+                pairs = parsed
+            else:
+                pairs = [parsed]
+
+            # Filter out error responses
+            pairs = [p for p in pairs if isinstance(p, dict) and ("anchor_premise" in p or "anchor_hypothesis" in p)]
+            for p in pairs:
+                p["source_pattern"] = pattern["pattern_id"]
+            all_pairs.extend(pairs)
+            print(f"    → {len(pairs)} pairs parsed")
+            remaining -= n
 
     print(f"Generated {len(all_pairs)} pairs total")
     return all_pairs
@@ -205,20 +262,29 @@ def validate_pairs(client: OpenAI, model: str, pairs: list, temperature: float =
         prompt = VALIDATE_PROMPT.format(pairs="\n\n".join(formatted))
         response = call_llm(client, model, VALIDATE_SYSTEM, prompt, temperature)
 
-        try:
-            validations = json.loads(response)
-            if isinstance(validations, dict) and "validations" in validations:
-                validations = validations["validations"]
-            if not isinstance(validations, list):
-                validations = [validations]
-
-            for v in validations:
-                idx = v.get("index", -1)
-                if 0 <= idx < len(batch) and v.get("anchor_valid") and v.get("cf_valid"):
-                    valid_pairs.append(batch[idx])
-        except json.JSONDecodeError:
+        parsed = extract_json(response)
+        if parsed is None:
             # If validation parsing fails, keep all pairs in this batch
             valid_pairs.extend(batch)
+            continue
+
+        validations = parsed
+        if isinstance(validations, dict):
+            for key in ["validations", "results", "data"]:
+                if key in validations:
+                    validations = validations[key]
+                    break
+            else:
+                validations = [validations]
+        if not isinstance(validations, list):
+            validations = [validations]
+
+        for v in validations:
+            if not isinstance(v, dict):
+                continue
+            idx = v.get("index", -1)
+            if 0 <= idx < len(batch) and v.get("anchor_valid") and v.get("cf_valid"):
+                valid_pairs.append(batch[idx])
 
     print(f"Validated: {len(valid_pairs)}/{len(pairs)} pairs passed")
     return valid_pairs

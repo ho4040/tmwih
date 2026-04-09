@@ -24,9 +24,11 @@ def collect_failures(config_path: str, model_dir: str | None = None):
     if model_dir is None:
         model_dir = os.path.join(cfg["output_dir"], "baseline")
 
-    # Load model and tokenizer
+    # Load model and tokenizer (use eager attention for output_attentions support)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(device)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_dir, attn_implementation="eager"
+    ).to(device)
     model.eval()
 
     # Setup Integrated Gradients

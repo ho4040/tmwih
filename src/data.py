@@ -1,5 +1,6 @@
-"""Dataset loading and preprocessing for SNLI + OOD evaluation sets."""
+"""Dataset loading and preprocessing for SNLI, FEVER + OOD evaluation sets."""
 
+import json
 import os
 import urllib.request
 
@@ -91,6 +92,98 @@ def load_kaushik_cad(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128):
 
     ds = ds.map(tokenize, batched=True)
     ds.set_format("torch")
+    return ds
+
+
+FEVER_LABEL_MAP = {"SUPPORTS": 0, "REFUTES": 2, "NOT ENOUGH INFO": 1}
+FEVER_LABEL_NAMES = ["SUPPORTS", "NOT ENOUGH INFO", "REFUTES"]
+
+
+def load_fever(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128):
+    """Load and tokenize FEVER dataset for fact verification."""
+    ds = load_dataset("fever/fever", "v1.0")
+
+    # Filter to only verifiable claims with labels
+    def has_valid_label(x):
+        return x.get("label", "") in FEVER_LABEL_MAP
+
+    ds = ds.filter(has_valid_label)
+
+    # Map labels to integers
+    def map_labels(batch):
+        batch["label"] = [FEVER_LABEL_MAP[l] for l in batch["label"]]
+        return batch
+
+    ds = ds.map(map_labels, batched=True)
+
+    def tokenize(batch):
+        # FEVER: claim is the hypothesis, evidence is the premise
+        premises = [e if isinstance(e, str) else str(e) for e in batch.get("evidence", batch.get("claim", []))]
+        hypotheses = batch["claim"] if "evidence" in batch else [""] * len(premises)
+        return tokenizer(
+            premises, hypotheses,
+            truncation=True, padding="max_length", max_length=max_seq_length,
+        )
+
+    cols_to_remove = [c for c in ds["train"].column_names if c not in ["label"]]
+    ds = ds.map(tokenize, batched=True, remove_columns=cols_to_remove)
+    ds.set_format("torch")
+    return ds
+
+
+def load_fever_symmetric(tokenizer: PreTrainedTokenizer, max_seq_length: int = 128, data_dir: str = "data"):
+    """Load FEVER Symmetric evaluation set (OOD for fact verification)."""
+    sym_path = os.path.join(data_dir, "fever_symmetric.jsonl")
+    if not os.path.exists(sym_path):
+        os.makedirs(data_dir, exist_ok=True)
+        # Try downloading from GitHub
+        urls = [
+            "https://raw.githubusercontent.com/TalSchuster/FeverSymmetric/master/symmetric_v0.1/fever_symmetric_generated.jsonl",
+            "https://raw.githubusercontent.com/TalSchuster/FeverSymmetric/master/symmetric_v0.2/fever_symmetric_dev.jsonl",
+        ]
+        downloaded = False
+        for url in urls:
+            try:
+                print(f"Downloading FEVER Symmetric from {url}...")
+                urllib.request.urlretrieve(url, sym_path)
+                downloaded = True
+                break
+            except Exception as e:
+                print(f"  Failed: {e}")
+                continue
+
+        if not downloaded:
+            print("Warning: Could not download FEVER Symmetric. Skipping.")
+            return None
+
+    # Parse JSONL
+    records = []
+    with open(sym_path) as f:
+        for line in f:
+            obj = json.loads(line.strip())
+            label = obj.get("label", obj.get("gold_label", ""))
+            if label in FEVER_LABEL_MAP:
+                records.append({
+                    "premise": obj.get("evidence", obj.get("evidence_sentence", "")),
+                    "hypothesis": obj.get("claim", ""),
+                    "label": FEVER_LABEL_MAP[label],
+                })
+
+    if not records:
+        print("Warning: No valid FEVER Symmetric records found")
+        return None
+
+    ds = Dataset.from_list(records)
+
+    def tokenize(batch):
+        return tokenizer(
+            batch["premise"], batch["hypothesis"],
+            truncation=True, padding="max_length", max_length=max_seq_length,
+        )
+
+    ds = ds.map(tokenize, batched=True, remove_columns=["premise", "hypothesis"])
+    ds.set_format("torch")
+    print(f"Loaded {len(ds)} FEVER Symmetric examples")
     return ds
 
 

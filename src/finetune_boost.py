@@ -55,21 +55,27 @@ class CounterfactualPairDataset(Dataset):
         }
 
 
-def contrastive_loss_fn(anchor_logits, cf_logits, margin=1.0):
-    """Contrastive loss on classification head outputs.
+def contrastive_loss_fn(anchor_logits, cf_logits, anchor_labels, cf_labels):
+    """Supervised contrastive loss on classification head logit space.
 
-    Pushes anchor and counterfactual logits apart (they should predict different classes).
-    Applied on logits (classification head level), NOT on embeddings.
+    For each pair, the anchor and counterfactual have different labels.
+    We want the model to increase the logit gap for the correct classes:
+    - anchor should have high logit for anchor_label and low for cf_label
+    - cf should have high logit for cf_label and low for anchor_label
     """
-    # Normalize logits to probabilities
-    anchor_probs = F.softmax(anchor_logits, dim=-1)
-    cf_probs = F.softmax(cf_logits, dim=-1)
-
-    # KL divergence between the two distributions (should be large)
-    # We minimize negative KL → maximize divergence
-    kl = F.kl_div(anchor_probs.log(), cf_probs, reduction="batchmean")
-    loss = F.relu(margin - kl)
-    return loss
+    batch_size = anchor_logits.size(0)
+    loss = 0.0
+    for i in range(batch_size):
+        # Anchor: increase target logit, decrease the cf's target logit
+        anchor_target = anchor_logits[i, anchor_labels[i]]
+        anchor_confuse = anchor_logits[i, cf_labels[i]]
+        # CF: increase target logit, decrease the anchor's target logit
+        cf_target = cf_logits[i, cf_labels[i]]
+        cf_confuse = cf_logits[i, anchor_labels[i]]
+        # Margin ranking: target should be higher than confusing class by margin
+        loss += F.relu(1.0 - (anchor_target - anchor_confuse))
+        loss += F.relu(1.0 - (cf_target - cf_confuse))
+    return loss / (2 * batch_size)
 
 
 def evaluate(model, dataloader, device):
@@ -169,7 +175,7 @@ def finetune(config_path: str, iteration: int = 1, model_dir: str | None = None)
             ce_loss = (anchor_out.loss + cf_out.loss) / 2
 
             # Contrastive loss on logits
-            cl_loss = contrastive_loss_fn(anchor_out.logits, cf_out.logits)
+            cl_loss = contrastive_loss_fn(anchor_out.logits, cf_out.logits, anchor_labels, cf_labels)
 
             loss = ce_loss + lam * cl_loss
             loss.backward()

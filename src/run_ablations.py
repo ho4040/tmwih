@@ -17,7 +17,11 @@ from tqdm import tqdm
 from data import load_snli, load_hans, LABEL_MAP
 from finetune_boost import CounterfactualPairDataset, contrastive_loss_fn, evaluate
 from run_comparison import SimpleNLIDataset, finetune_simple
-from diagnose_generate import call_llm, extract_json, DIAGNOSE_SYSTEM, DIAGNOSE_PROMPT, GENERATE_SYSTEM, GENERATE_PROMPT
+from diagnose_generate import (
+    call_llm, extract_json,
+    DIAGNOSE_SYSTEM, DIAGNOSE_PROMPT, GENERATE_SYSTEM, GENERATE_PROMPT,
+    diagnose, diagnose_with_filter, filter_gold_errors, generate_pairs, validate_pairs,
+)
 from evaluate_failures import collect_failures
 from openai import OpenAI
 
@@ -380,6 +384,152 @@ def run_llm_dependency(config_path: str):
 
 
 # ============================================================
+# 4. Gold Error Filtering Ablation
+# ============================================================
+
+def run_gold_filter_ablation(config_path: str):
+    """Compare pipelines with/without gold error filtering.
+
+    Conditions:
+    A) No filtering (current baseline) — diagnose+generate / validate = 2 LLM stages
+    B) Separate filter then diagnose — filter / diagnose+generate / validate = 3 LLM stages
+    C) Combined filter+diagnose — filter+diagnose / generate / validate = 3 LLM stages
+    """
+    print("\n" + "=" * 60)
+    print("ABLATION 4: Gold Error Filtering")
+    print("=" * 60)
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+
+    bcfg = cfg["boosting"]
+    baseline_dir = os.path.join(cfg["output_dir"], "baseline")
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY not found")
+
+    client = OpenAI(base_url=cfg["openrouter_base_url"], api_key=api_key)
+    teacher = bcfg["teacher_model"]
+
+    # Load failures
+    failures_path = os.path.join(cfg["output_dir"], "failures.json")
+    with open(failures_path) as f:
+        data = json.load(f)
+    failures = data["failures"]
+
+    out_base = os.path.join(cfg["output_dir"], "ablation_gold_filter")
+    os.makedirs(out_base, exist_ok=True)
+    results = {}
+
+    # --- Condition A: No filtering (current baseline) ---
+    print("\n--- Condition A: No filtering ---")
+    a_pairs_path = os.path.join(out_base, "no_filter", "pairs_valid.json")
+    if os.path.exists(a_pairs_path):
+        with open(a_pairs_path) as f:
+            a_pairs = json.load(f)
+        print(f"  Loaded {len(a_pairs)} existing pairs")
+    else:
+        patterns_a = diagnose(client, teacher, failures)
+        pairs_a = generate_pairs(client, teacher, patterns_a, bcfg["samples_per_iteration"])
+        a_pairs = validate_pairs(client, teacher, pairs_a)
+        os.makedirs(os.path.join(out_base, "no_filter"), exist_ok=True)
+        with open(a_pairs_path, "w") as f:
+            json.dump(a_pairs, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(out_base, "no_filter", "patterns.json"), "w") as f:
+            json.dump(patterns_a, f, indent=2, ensure_ascii=False)
+
+    if a_pairs:
+        n = min(200, len(a_pairs))
+        from run_comparison import finetune_with_pairs
+        r_a = finetune_with_pairs(config_path, a_pairs[:n], baseline_dir,
+                                   os.path.join(out_base, "no_filter_finetune"))
+        if r_a:
+            r_a["condition"] = "A_no_filter"
+            r_a["num_pairs_generated"] = len(a_pairs)
+            r_a["gold_errors_found"] = 0
+            results["A_no_filter"] = r_a
+
+    # --- Condition B: Separate filter → diagnose ---
+    print("\n--- Condition B: Separate filter then diagnose ---")
+    b_pairs_path = os.path.join(out_base, "separate_filter", "pairs_valid.json")
+    if os.path.exists(b_pairs_path):
+        with open(b_pairs_path) as f:
+            b_pairs = json.load(f)
+        # Load gold errors count
+        ge_path = os.path.join(out_base, "separate_filter", "gold_errors.json")
+        b_gold_errors = json.load(open(ge_path)) if os.path.exists(ge_path) else []
+        print(f"  Loaded {len(b_pairs)} existing pairs")
+    else:
+        clean_failures, b_gold_errors = filter_gold_errors(client, teacher, failures)
+        patterns_b = diagnose(client, teacher, clean_failures)
+        pairs_b = generate_pairs(client, teacher, patterns_b, bcfg["samples_per_iteration"])
+        b_pairs = validate_pairs(client, teacher, pairs_b)
+        os.makedirs(os.path.join(out_base, "separate_filter"), exist_ok=True)
+        with open(b_pairs_path, "w") as f:
+            json.dump(b_pairs, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(out_base, "separate_filter", "gold_errors.json"), "w") as f:
+            json.dump(b_gold_errors, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(out_base, "separate_filter", "patterns.json"), "w") as f:
+            json.dump(patterns_b, f, indent=2, ensure_ascii=False)
+
+    if b_pairs:
+        n = min(200, len(b_pairs))
+        r_b = finetune_with_pairs(config_path, b_pairs[:n], baseline_dir,
+                                   os.path.join(out_base, "separate_filter_finetune"))
+        if r_b:
+            r_b["condition"] = "B_separate_filter"
+            r_b["num_pairs_generated"] = len(b_pairs)
+            r_b["gold_errors_found"] = len(b_gold_errors)
+            results["B_separate_filter"] = r_b
+
+    # --- Condition C: Combined filter+diagnose ---
+    print("\n--- Condition C: Combined filter+diagnose ---")
+    c_pairs_path = os.path.join(out_base, "combined_filter", "pairs_valid.json")
+    if os.path.exists(c_pairs_path):
+        with open(c_pairs_path) as f:
+            c_pairs = json.load(f)
+        ge_path = os.path.join(out_base, "combined_filter", "gold_errors.json")
+        c_gold_errors = json.load(open(ge_path)) if os.path.exists(ge_path) else []
+        print(f"  Loaded {len(c_pairs)} existing pairs")
+    else:
+        patterns_c, c_gold_errors = diagnose_with_filter(client, teacher, failures)
+        pairs_c = generate_pairs(client, teacher, patterns_c, bcfg["samples_per_iteration"])
+        c_pairs = validate_pairs(client, teacher, pairs_c)
+        os.makedirs(os.path.join(out_base, "combined_filter"), exist_ok=True)
+        with open(c_pairs_path, "w") as f:
+            json.dump(c_pairs, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(out_base, "combined_filter", "gold_errors.json"), "w") as f:
+            json.dump(c_gold_errors, f, indent=2, ensure_ascii=False)
+        with open(os.path.join(out_base, "combined_filter", "patterns.json"), "w") as f:
+            json.dump(patterns_c, f, indent=2, ensure_ascii=False)
+
+    if c_pairs:
+        n = min(200, len(c_pairs))
+        r_c = finetune_with_pairs(config_path, c_pairs[:n], baseline_dir,
+                                   os.path.join(out_base, "combined_filter_finetune"))
+        if r_c:
+            r_c["condition"] = "C_combined_filter"
+            r_c["num_pairs_generated"] = len(c_pairs)
+            r_c["gold_errors_found"] = len(c_gold_errors)
+            results["C_combined_filter"] = r_c
+
+    # Summary
+    print("\n--- Gold Error Filtering Summary ---")
+    print(f"{'Condition':<25} {'HANS':>8} {'Test':>8} {'Pairs':>6} {'Gold Err':>9}")
+    print("-" * 60)
+    for key, r in results.items():
+        print(f"{key:<25} {r['post_hans_acc']:>8.4f} {r['post_test_acc']:>8.4f} "
+              f"{r['num_pairs_generated']:>6} {r['gold_errors_found']:>9}")
+
+    # Save
+    with open(os.path.join(out_base, "results.json"), "w") as f:
+        json.dump(results, f, indent=2, default=lambda x: round(x, 6) if isinstance(x, float) else x)
+
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -394,6 +544,9 @@ def run_all(config_path: str):
 
     # 3. LLM dependency
     all_results["llm_dependency"] = run_llm_dependency(config_path)
+
+    # 4. Gold error filtering
+    all_results["gold_filter"] = run_gold_filter_ablation(config_path)
 
     # Final summary
     print("\n" + "=" * 70)
@@ -423,5 +576,17 @@ def run_all(config_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--ablation", choices=["all", "contrastive", "distillation", "llm", "gold_filter"],
+                        default="all", help="Which ablation to run")
     args = parser.parse_args()
-    run_all(args.config)
+
+    if args.ablation == "all":
+        run_all(args.config)
+    elif args.ablation == "contrastive":
+        run_contrastive_ablation(args.config)
+    elif args.ablation == "distillation":
+        run_hard_distillation(args.config)
+    elif args.ablation == "llm":
+        run_llm_dependency(args.config)
+    elif args.ablation == "gold_filter":
+        run_gold_filter_ablation(args.config)

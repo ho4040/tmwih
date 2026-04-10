@@ -36,6 +36,66 @@ Output as JSON array:
   "count": number of cases matching
 }}]"""
 
+# --- Gold Error Filtering ---
+
+FILTER_SYSTEM = """You are an expert NLI (Natural Language Inference) annotator. Your job is to verify whether gold labels in a dataset are correct.
+
+Labels:
+- entailment: the hypothesis is definitely true given the premise
+- neutral: the hypothesis might or might not be true given the premise
+- contradiction: the hypothesis is definitely false given the premise"""
+
+FILTER_PROMPT = """Below are cases where a classification model's prediction disagrees with the gold label.
+Some of these may be genuine model errors, but others may be GOLD LABEL ERRORS (the dataset label is wrong and the model is actually correct).
+
+For each case, evaluate whether the gold label is correct. Consider:
+- The model's confidence score (high confidence disagreement may indicate gold error)
+- The attention/gradient signals (if the model focused on relevant tokens but still "failed", the gold label may be wrong)
+
+Cases:
+{failures}
+
+Output as JSON array:
+[{{"index": i, "gold_correct": true/false, "correct_label": "entailment|neutral|contradiction", "reason": "brief explanation"}}]"""
+
+DIAGNOSE_WITH_FILTER_SYSTEM = """You are an expert NLP model diagnostician. You analyze why classification models make errors by examining their internal signals (attention and gradient attribution scores).
+
+IMPORTANT: Some failure cases may have incorrect gold labels (annotation errors). You must first assess whether the gold label is correct before diagnosing."""
+
+DIAGNOSE_WITH_FILTER_PROMPT = """Below are cases where an NLI model's prediction disagrees with the gold label.
+
+STEP 1: For each case, first evaluate whether the gold label is correct.
+- High-confidence disagreements may indicate gold label errors.
+- If the model focused on relevant tokens (per attention/gradient) but still "failed", suspect the gold label.
+
+STEP 2: For cases where the gold label IS correct (genuine model errors), identify 3-5 systematic weakness patterns.
+
+Each case includes:
+- The premise and hypothesis
+- The gold label and the model's prediction
+- Model confidence score
+- Per-token attention and gradient attribution scores
+
+Cases:
+{failures}
+
+Output as JSON:
+{{
+  "gold_errors": [
+    {{"index": i, "correct_label": "...", "reason": "..."}}
+  ],
+  "patterns": [
+    {{
+      "pattern_id": "short_identifier",
+      "description": "What the model gets wrong",
+      "overrelied_tokens": ["tokens the model over-relies on"],
+      "missed_signal": "What linguistic signal the model misses",
+      "example_indices": [indices of genuine failures matching this pattern],
+      "count": number
+    }}
+  ]
+}}"""
+
 GENERATE_SYSTEM = """You are an expert at generating counterfactual minimal pairs for NLI (Natural Language Inference).
 
 A minimal pair consists of two premise-hypothesis pairs that differ minimally (1-2 words changed) but have different NLI labels (entailment, neutral, contradiction).
@@ -149,20 +209,7 @@ def extract_json(text: str) -> list | dict | None:
 
 def diagnose(client: OpenAI, model: str, failures: list, temperature: float = 0.7) -> list:
     """Diagnose failure patterns using LLM."""
-    # Format failures for the prompt (limit to avoid token overflow)
-    formatted = []
-    for i, f in enumerate(failures[:50]):  # max 50 for diagnosis
-        top_tokens = sorted(f["token_attributions"], key=lambda x: x["gradient"], reverse=True)[:5]
-        attn_str = ", ".join(f'{t["token"]}:{t["attention"]}' for t in top_tokens)
-        grad_str = ", ".join(f'{t["token"]}:{t["gradient"]}' for t in top_tokens)
-        formatted.append(
-            f"[{i}] Premise: {f['premise']}\n"
-            f"    Hypothesis: {f['hypothesis']}\n"
-            f"    True: {f['true_label']} | Predicted: {f['predicted_label']} | Conf: {f['confidence']}\n"
-            f"    Top Attention: [{attn_str}]\n"
-            f"    Top Gradient: [{grad_str}]"
-        )
-
+    formatted = _format_failures(failures)
     prompt = DIAGNOSE_PROMPT.format(failures="\n\n".join(formatted))
     print(f"Diagnosing {len(formatted)} failures...")
 
@@ -187,6 +234,115 @@ def diagnose(client: OpenAI, model: str, failures: list, temperature: float = 0.
 
     print(f"Found {len(patterns)} weakness patterns")
     return patterns
+
+
+def filter_gold_errors(client: OpenAI, model: str, failures: list, temperature: float = 0.3) -> tuple[list, list]:
+    """Filter out suspected gold label errors from failure cases.
+    Returns (clean_failures, gold_errors)."""
+    formatted = _format_failures(failures)
+    prompt = FILTER_PROMPT.format(failures="\n\n".join(formatted))
+    print(f"Filtering {len(formatted)} failures for gold label errors...")
+
+    response = call_llm(client, model, FILTER_SYSTEM, prompt, temperature, log_dir="outputs/logs")
+    parsed = extract_json(response)
+
+    if parsed is None:
+        print("Warning: Failed to parse filter response, keeping all failures")
+        return failures, []
+
+    validations = parsed
+    if isinstance(validations, dict):
+        for key in ["validations", "results", "data"]:
+            if key in validations:
+                validations = validations[key]
+                break
+        else:
+            validations = [validations]
+    if not isinstance(validations, list):
+        validations = [validations]
+
+    gold_error_indices = set()
+    gold_errors = []
+    for v in validations:
+        if not isinstance(v, dict):
+            continue
+        idx = v.get("index", -1)
+        if 0 <= idx < len(failures) and not v.get("gold_correct", True):
+            gold_error_indices.add(idx)
+            gold_errors.append({
+                "index": idx,
+                "premise": failures[idx]["premise"],
+                "hypothesis": failures[idx]["hypothesis"],
+                "gold_label": failures[idx]["true_label"],
+                "model_prediction": failures[idx]["predicted_label"],
+                "suggested_label": v.get("correct_label", ""),
+                "reason": v.get("reason", ""),
+            })
+
+    clean = [f for i, f in enumerate(failures) if i not in gold_error_indices]
+    print(f"Gold error filtering: {len(gold_errors)} suspected errors removed, {len(clean)} clean failures remain")
+    return clean, gold_errors
+
+
+def diagnose_with_filter(client: OpenAI, model: str, failures: list, temperature: float = 0.7) -> tuple[list, list]:
+    """Combined gold error filtering + diagnosis in a single LLM call.
+    Returns (patterns, gold_errors)."""
+    formatted = _format_failures(failures)
+    prompt = DIAGNOSE_WITH_FILTER_PROMPT.format(failures="\n\n".join(formatted))
+    print(f"Diagnosing {len(formatted)} failures (with gold error filtering)...")
+
+    response = call_llm(client, model, DIAGNOSE_WITH_FILTER_SYSTEM, prompt, temperature, log_dir="outputs/logs")
+    parsed = extract_json(response)
+
+    if parsed is None:
+        print("Warning: Failed to parse combined response")
+        return [], []
+
+    gold_errors = []
+    patterns = []
+
+    if isinstance(parsed, dict):
+        raw_errors = parsed.get("gold_errors", [])
+        if isinstance(raw_errors, list):
+            for e in raw_errors:
+                if isinstance(e, dict):
+                    idx = e.get("index", -1)
+                    if 0 <= idx < len(failures):
+                        gold_errors.append({
+                            "index": idx,
+                            "premise": failures[idx]["premise"],
+                            "hypothesis": failures[idx]["hypothesis"],
+                            "gold_label": failures[idx]["true_label"],
+                            "model_prediction": failures[idx]["predicted_label"],
+                            "suggested_label": e.get("correct_label", ""),
+                            "reason": e.get("reason", ""),
+                        })
+
+        raw_patterns = parsed.get("patterns", [])
+        if isinstance(raw_patterns, list):
+            patterns = [p for p in raw_patterns if isinstance(p, dict)]
+    elif isinstance(parsed, list):
+        patterns = [p for p in parsed if isinstance(p, dict)]
+
+    print(f"Found {len(patterns)} weakness patterns, {len(gold_errors)} suspected gold errors")
+    return patterns, gold_errors
+
+
+def _format_failures(failures: list, max_n: int = 50) -> list[str]:
+    """Format failure cases for LLM prompts."""
+    formatted = []
+    for i, f in enumerate(failures[:max_n]):
+        top_tokens = sorted(f["token_attributions"], key=lambda x: x["gradient"], reverse=True)[:5]
+        attn_str = ", ".join(f'{t["token"]}:{t["attention"]}' for t in top_tokens)
+        grad_str = ", ".join(f'{t["token"]}:{t["gradient"]}' for t in top_tokens)
+        formatted.append(
+            f"[{i}] Premise: {f['premise']}\n"
+            f"    Hypothesis: {f['hypothesis']}\n"
+            f"    True: {f['true_label']} | Predicted: {f['predicted_label']} | Conf: {f['confidence']}\n"
+            f"    Top Attention: [{attn_str}]\n"
+            f"    Top Gradient: [{grad_str}]"
+        )
+    return formatted
 
 
 def generate_pairs(client: OpenAI, model: str, patterns: list, samples_per_iter: int, temperature: float = 0.7) -> list:
